@@ -4537,6 +4537,23 @@ function AdminApp({ theme, setTheme }) {
   const [importJsxCategory, setImportJsxCategory] = useState("Entreprise");
   const [importJsxRaw, setImportJsxRaw] = useState("");
   const [importingJsx, setImportingJsx] = useState(false);
+  const [importJsxFileName, setImportJsxFileName] = useState("");
+  const jsxFileInputRef = useRef(null);
+  // AJOUT (27/08/2026) : sélection directe du fichier .jsx depuis le disque
+  // (au lieu d'un copier-coller obligatoire) — lu en local dans le
+  // navigateur via FileReader, jamais envoyé nulle part avant l'appel IA.
+  function handleJsxFileChange(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImportJsxRaw(String(reader.result || ""));
+      setImportJsxFileName(file.name);
+      if (!importJsxName.trim()) setImportJsxName(file.name.replace(/\.[^./\\]+$/, ""));
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
   function openProjectEntry(entry) {
     setNewProjectOpen(entry === "new");
     setImportOpen(entry === "email");
@@ -4622,17 +4639,34 @@ function AdminApp({ theme, setTheme }) {
         if (g && val && String(val).trim()) answers[gid] = { text: String(val).trim(), confidence: 70, state: "confirme", label: g.label };
       });
     }
+    // AJOUT (27/08/2026) : enchaînement direct synthèse + conception après
+    // l'extraction du code, demandé par le porteur pour voir les patterns
+    // détectés (Socle appliqué + exigences pertinentes) en un seul clic
+    // plutôt que devoir enchaîner manuellement "Générer la synthèse" puis
+    // "Générer la conception". Mêmes fonctions que le parcours manuel
+    // (buildSynthesis, buildConception) — aucune duplication de logique.
+    // Chaque étape reste résiliente : un échec IA sur la synthèse ou la
+    // conception laisse quand même le projet créé avec ses réponses brutes,
+    // au lieu de tout perdre — comme le fait déjà retrySynthesis ailleurs.
+    let synthesis = null; let synthesisError = null;
+    try { synthesis = await buildSynthesis(answers, []); }
+    catch (e) { synthesisError = `La synthèse a échoué (${e.message}) — réponses conservées, réessayable depuis l'onglet Diagnostic.`; }
+    let conception = null; let conceptionError = null;
+    if (synthesis) {
+      try { conception = await buildConception(synthesis, answers.ambiance?.text, null, null); }
+      catch (e) { conceptionError = `La conception a échoué (${e.message}) — réessayable depuis l'onglet Conception.`; }
+    }
     const full = {
       id, nom: importJsxName.trim(), categorie: importJsxCategory, statut: "Exploration", entreprise: null,
       documents: [{ id: genId(), type: "note", text: importJsxRaw.slice(0, 40000), label: "Code .jsx importé (source, tronqué à l'aperçu)", date: new Date().toISOString() }],
-      conversation: [], date: new Date().toISOString(), discovery: { answers, synthesis: null, error: null }, conception: null,
+      conversation: [], date: new Date().toISOString(), discovery: { answers, synthesis, error: synthesisError }, conception, conceptionError,
       codeExistant: importJsxRaw,
     };
     await persistFullProject(full);
     const secteurLabel = { sante: "Santé", juridique: "Juridique", enfance: "Enfance", finance: "Finance", public: "Service public" }[detectedSectors[0]] || "Général";
-    await persistIndex([{ id, nom: full.nom, categorie: full.categorie, statut: full.statut, date: full.date, hasDiscovery: Object.keys(answers).length > 0, hasConception: false, secteurTag: secteurLabel }, ...index]);
+    await persistIndex([{ id, nom: full.nom, categorie: full.categorie, statut: full.statut, date: full.date, hasDiscovery: Object.keys(answers).length > 0, hasConception: !!conception, secteurTag: secteurLabel }, ...index]);
     setImportingJsx(false);
-    setImportJsxName(""); setImportJsxRaw(""); setImportJsxOpen(false);
+    setImportJsxName(""); setImportJsxRaw(""); setImportJsxFileName(""); setImportJsxOpen(false);
     setSelectedId(id);
   }
   // Import en LOT, additif — contrairement à Réglages → Restaurer (qui
@@ -4970,11 +5004,16 @@ Leçons intégrées au dossier universel : ${promptAddendum ? promptAddendum.spl
           )}
           {importJsxOpen && (
             <div className="mb-5 p-4 rounded-xl bg-surface border border-app space-y-3">
-              <p className="text-11 text-slate-500">Colle le code source (.jsx) d'une appli que tu as déjà construite. L'IA lit le code pour déduire les réponses du diagnostic — vérifie et complète ensuite dans la fiche projet. Le code est aussi conservé dans "Code existant" (mode reprise). Sur un fichier volumineux, seuls les 40 000 premiers caractères sont lus par l'IA — les réponses générées restent à relire, pas à prendre pour acquises.</p>
+              <p className="text-11 text-slate-500">Choisis directement le fichier .jsx d'une appli que tu as déjà construite (ou colle son contenu ci-dessous). Trois appels IA s'enchaînent automatiquement : lecture du code, synthèse du diagnostic, puis conception — à la fin, les patterns détectés ("Socle appliqué") sont visibles directement dans l'onglet Conception de la fiche. Le code est aussi conservé dans "Code existant" (mode reprise). Sur un fichier volumineux, seuls les 40 000 premiers caractères sont lus — les réponses générées restent à relire, pas à prendre pour acquises. Si une des trois étapes échoue (ex. crédit API), le projet est quand même créé avec ce qui a réussi, à réessayer depuis sa fiche.</p>
+              <input ref={jsxFileInputRef} type="file" accept=".jsx,.js,.tsx,.ts,text/plain" onChange={handleJsxFileChange} className="hidden" />
+              <div className="flex items-center gap-2">
+                <button onClick={() => jsxFileInputRef.current?.click()} className="text-13 bg-surface-2 border border-app rounded-lg px-3 py-2 flex items-center gap-2 hover:border-amber-400/40"><FileCode size={14} /> Choisir un fichier .jsx</button>
+                {importJsxFileName && <span className="text-11 text-slate-500 truncate">{importJsxFileName} ({(importJsxRaw.length / 1024).toFixed(0)} Ko)</span>}
+              </div>
               <input value={importJsxName} onChange={(e) => setImportJsxName(e.target.value)} placeholder="Nom du projet (ex. L'Œil)" className="w-full bg-surface-2 border border-app rounded-lg px-3 py-2 text-14 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
               <div className="flex gap-2">{CATEGORIES.map((c) => (<button key={c} onClick={() => setImportJsxCategory(c)} className={`px-3 py-1.5 rounded-full text-12 border transition-colors ${importJsxCategory === c ? "bg-amber-400 text-app border-amber-400" : "border-app text-slate-400"}`}>{c}</button>))}</div>
-              <textarea value={importJsxRaw} onChange={(e) => setImportJsxRaw(e.target.value)} rows={10} placeholder="Colle ici le contenu du fichier .jsx…" className="w-full bg-surface-2 border border-app rounded-xl px-3.5 py-2.5 text-11 placeholder:text-slate-600 font-mono-data" />
-              <div className="flex gap-2 justify-end"><button onClick={() => setImportJsxOpen(false)} className="text-13 text-slate-500 px-3 py-1.5">Annuler</button><button onClick={importJsxApp} disabled={!importJsxName.trim() || !importJsxRaw.trim() || importingJsx} className="text-13 bg-amber-400 text-app px-3 py-1.5 rounded-lg disabled:opacity-40 flex items-center gap-2">{importingJsx && <Loader2 size={14} className="animate-spin" />}{importingJsx ? "Lecture du code…" : "Importer et analyser le code"}</button></div>
+              <textarea value={importJsxRaw} onChange={(e) => { setImportJsxRaw(e.target.value); setImportJsxFileName(""); }} rows={10} placeholder="…ou colle ici le contenu du fichier .jsx" className="w-full bg-surface-2 border border-app rounded-xl px-3.5 py-2.5 text-11 placeholder:text-slate-600 font-mono-data" />
+              <div className="flex gap-2 justify-end"><button onClick={() => setImportJsxOpen(false)} className="text-13 text-slate-500 px-3 py-1.5">Annuler</button><button onClick={importJsxApp} disabled={!importJsxName.trim() || !importJsxRaw.trim() || importingJsx} className="text-13 bg-amber-400 text-app px-3 py-1.5 rounded-lg disabled:opacity-40 flex items-center gap-2">{importingJsx && <Loader2 size={14} className="animate-spin" />}{importingJsx ? "Analyse, synthèse et conception…" : "Importer et détecter les patterns"}</button></div>
             </div>
           )}
           {importOpen && (

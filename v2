@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>NANDĒM Core</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react"
+  }
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body style="margin:0;">
+<div id="root">
+  <div style="font-family: ui-sans-serif, system-ui, sans-serif; padding: 2rem; color: #444;">
+    Chargement de NANDĒM Core…
+  </div>
+</div>
+
+<script>
+  // CORRECTIF (27/08/2026) : point d'entrée ajouté pour le déploiement Vercel
+  // en production. Le dépôt GitHub ne contenait que le fichier .jsx, sans
+  // page HTML à servir — Vercel renvoyait 404 sur toutes les routes. Ce
+  // fichier reprend exactement le harnais qui fonctionne déjà en aperçu
+  // local (nandem-core-preview.html), avec deux différences seulement :
+  //  1. le fichier source est chargé depuis GitHub (raw.githubusercontent.com)
+  //     plutôt qu'en relatif, puisque le .jsx n'est pas dans ce déploiement
+  //     manuel — ainsi aucune duplication du fichier de 445 Ko n'est
+  //     nécessaire pour corriger le 404 immédiatement ;
+  //  2. le stockage reste un shim mémoire (perdu à la fermeture de l'onglet)
+  //     — la vraie persistance (window.storage) n'existe que dans l'environnement
+  //     artifact Claude ou en dev local via vite.config.js. Statut : Hypothèse
+  //     tant que non confirmé en usage réel prolongé sur ce déploiement.
+  window.storage = (function () {
+    const mem = new Map();
+    return {
+      async get(key) { return mem.has(key) ? { value: mem.get(key) } : undefined; },
+      async set(key, value) { mem.set(key, String(value)); },
+      async delete(key) { mem.delete(key); },
+    };
+  })();
+</script>
+
+<script type="module">
+  import React from "react";
+  import { createRoot } from "react-dom/client";
+
+  const statusEl = document.getElementById("root");
+
+  function showError(title, detail) {
+    statusEl.innerHTML =
+      '<div style="font-family: ui-sans-serif, system-ui, sans-serif; padding: 2rem; max-width: 640px; color: #b91c1c;">' +
+      '<p style="font-weight: 600; margin: 0 0 8px;">' + title + '</p>' +
+      '<pre style="white-space: pre-wrap; font-size: 12px; background: #fef2f2; padding: 12px; border-radius: 8px;">' + detail + '</pre>' +
+      '</div>';
+  }
+
+  try {
+    const res = await fetch("https://raw.githubusercontent.com/trippypasseport-ui/nandem-core/main/nandem-core-v1_5_1-artifact.jsx");
+    if (!res.ok) throw new Error("Fichier nandem-core-v1_5_1-artifact.jsx introuvable sur GitHub (statut " + res.status + ").");
+    const source = await res.text();
+
+    // Transformation JSX uniquement — les instructions import/export du
+    // fichier réel sont conservées telles quelles, résolues ensuite par
+    // l'import map ci-dessus (react, react-dom, lucide-react).
+    const { code } = Babel.transform(source, {
+      filename: "nandem-core-v1_5_1-artifact.jsx",
+      presets: ["react"],
+      sourceType: "module",
+    });
+
+    const blob = new Blob([code], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const mod = await import(url);
+    const NandemCoreRoot = mod.default;
+
+    createRoot(statusEl).render(React.createElement(NandemCoreRoot));
+  } catch (err) {
+    showError(
+      "NANDĒM Core n'a pas pu démarrer.",
+      (err && err.message ? err.message : String(err))
+    );
+    console.error(err);
+  }
+</script>
+</body>
+</html>

@@ -4,7 +4,7 @@ import {
   FolderOpen, Library, Trash2, Check, Download, Wand2, Mail, Link2,
   FileText, Image as ImageIcon, MessageSquare, Building2, ChevronDown,
   Settings as SettingsIcon, HelpCircle, History, Users, Receipt, TrendingUp,
-  Lock, Pencil, Sun, Moon,
+  Lock, Pencil, Sun, Moon, FileCode,
 } from "lucide-react";
 // Onglets d'une fiche projet qui restent visibles mais verrouillés tant que
 // la synthèse du diagnostic n'existe pas — ajouté après une revue
@@ -1012,6 +1012,31 @@ Texte à trier :
 """${markdownText.slice(0, 20000)}"""
 
 Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}, vide ({}) si rien de pertinent au projet n'est présent. Ne reformule que ce qui concerne clairement le projet — jamais le reste.`;
+  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return {}; }
+}
+// AJOUT (27/08/2026) : import direct d'une appli déjà construite à partir de
+// son code source (.jsx) — demandé par le porteur pour enregistrer des
+// applis réelles (L'Œil, Foodtruck...) sans repasser par le questionnaire
+// manuel. Même principe que extractAppInfoFromMarkdown (lecture par l'IA,
+// réponses reformulées en JSON), mais le prompt lit du code plutôt qu'une
+// conversation à trier. Le code est plus dense que du texte libre — on
+// autorise donc une fenêtre plus large (40000 caractères), mais sur une
+// appli volumineuse (l'artefact de NANDĒM Core lui-même fait ~445 Ko, donc
+// ~445000 caractères), une grande partie reste hors de vue : statut
+// Hypothèse sur la complétude des réponses générées, à relire et compléter
+// dans la fiche projet après import — jamais à prendre pour Établi sans
+// relecture.
+async function extractAppInfoFromCode(codeText, allGoals) {
+  const list = allGoals.map((g) => `${g.id} : ${g.question}`).join("\n");
+  const prompt = `Voici le code source (React/JSX) d'une application déjà construite. Ta mission : déduire, à partir de ce que révèle réellement ce code (composants, état, textes visibles à l'écran, structure de données, appels réseau, commentaires), les réponses aux questions de diagnostic suivantes — comme si tu interviewais quelqu'un qui décrit son appli déjà faite.
+
+Sujets à couvrir (id : question) :
+${list}
+
+Code source (peut être tronqué si l'appli est volumineuse — base-toi uniquement sur ce qui est visible ci-dessous, n'invente rien au-delà) :
+"""${codeText.slice(0, 40000)}"""
+
+Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}. N'inclus que les id pour lesquels le code donne une réponse réellement déductible — laisse de côté ce qui n'est pas visible plutôt que de deviner.`;
   try { return extractJSON(await askClaude(prompt, 1500)); } catch { return {}; }
 }
 async function chatAboutMdImport(history, addendum) {
@@ -4505,11 +4530,19 @@ function AdminApp({ theme, setTheme }) {
   const [importBatchRaw, setImportBatchRaw] = useState("");
   const [importingBatch, setImportingBatch] = useState(false);
   const [importBatchResult, setImportBatchResult] = useState(null);
+  // AJOUT (27/08/2026) : import direct d'une appli déjà construite via son
+  // code .jsx — voir extractAppInfoFromCode plus haut.
+  const [importJsxOpen, setImportJsxOpen] = useState(false);
+  const [importJsxName, setImportJsxName] = useState("");
+  const [importJsxCategory, setImportJsxCategory] = useState("Entreprise");
+  const [importJsxRaw, setImportJsxRaw] = useState("");
+  const [importingJsx, setImportingJsx] = useState(false);
   function openProjectEntry(entry) {
     setNewProjectOpen(entry === "new");
     setImportOpen(entry === "email");
     setImportMdOpen(entry === "markdown");
     setImportBatchOpen(entry === "batch");
+    setImportJsxOpen(entry === "jsx");
     if (entry !== "batch") setImportBatchResult(null);
   }
   async function importClientEmail() {
@@ -4559,6 +4592,47 @@ function AdminApp({ theme, setTheme }) {
     await persistIndex([{ id, nom: full.nom, categorie: full.categorie, statut: full.statut, date: full.date, hasDiscovery: Object.keys(answers).length > 0, hasConception: false, secteurTag: secteurLabel }, ...index]);
     setImportingMd(false);
     setImportMdName(""); setImportMdRaw(""); setImportMdOpen(false);
+    setSelectedId(id);
+  }
+  // AJOUT (27/08/2026) : import direct d'une appli déjà construite à partir
+  // de son fichier .jsx — même principe que importMarkdownIdea (IA déduit
+  // les réponses du diagnostic), mais lit du code au lieu de texte libre, et
+  // remplit EN PLUS "Code existant" (Mode Reprise) avec le code collé, pour
+  // qu'une future itération sur ce projet ne reparte pas de zéro.
+  async function importJsxApp() {
+    if (!importJsxName.trim() || !importJsxRaw.trim() || importingJsx) return;
+    setImportingJsx(true);
+    const id = genId();
+    const goalsForCategory = getGoalsFor(importJsxCategory);
+    const extracted = await extractAppInfoFromCode(importJsxRaw, goalsForCategory);
+    const answers = {};
+    Object.entries(extracted || {}).forEach(([gid, val]) => {
+      const g = goalsForCategory.find((x) => x.id === gid);
+      if (g && val && String(val).trim()) answers[gid] = { text: String(val).trim(), confidence: 70, state: "confirme", label: g.label };
+    });
+    // Même correctif que pour l'import Markdown/documents : les questions
+    // sectorielles n'existent qu'après détection du secteur — un premier
+    // passage seul ne peut jamais les trouver.
+    const detectedSectors = detectSectors(answers.secteur?.text || "");
+    const sectorGoals = detectedSectors.map((key) => SECTOR_EXTRA_GOALS[key]).filter(Boolean);
+    if (sectorGoals.length) {
+      const sectorExtracted = await extractAppInfoFromCode(importJsxRaw, sectorGoals);
+      Object.entries(sectorExtracted || {}).forEach(([gid, val]) => {
+        const g = sectorGoals.find((x) => x.id === gid);
+        if (g && val && String(val).trim()) answers[gid] = { text: String(val).trim(), confidence: 70, state: "confirme", label: g.label };
+      });
+    }
+    const full = {
+      id, nom: importJsxName.trim(), categorie: importJsxCategory, statut: "Exploration", entreprise: null,
+      documents: [{ id: genId(), type: "note", text: importJsxRaw.slice(0, 40000), label: "Code .jsx importé (source, tronqué à l'aperçu)", date: new Date().toISOString() }],
+      conversation: [], date: new Date().toISOString(), discovery: { answers, synthesis: null, error: null }, conception: null,
+      codeExistant: importJsxRaw,
+    };
+    await persistFullProject(full);
+    const secteurLabel = { sante: "Santé", juridique: "Juridique", enfance: "Enfance", finance: "Finance", public: "Service public" }[detectedSectors[0]] || "Général";
+    await persistIndex([{ id, nom: full.nom, categorie: full.categorie, statut: full.statut, date: full.date, hasDiscovery: Object.keys(answers).length > 0, hasConception: false, secteurTag: secteurLabel }, ...index]);
+    setImportingJsx(false);
+    setImportJsxName(""); setImportJsxRaw(""); setImportJsxOpen(false);
     setSelectedId(id);
   }
   // Import en LOT, additif — contrairement à Réglages → Restaurer (qui
@@ -4872,6 +4946,7 @@ Leçons intégrées au dossier universel : ${promptAddendum ? promptAddendum.spl
             <button onClick={() => openProjectEntry("email")} className="flex-1 py-3 rounded-xl border border-dashed border-app-strong text-slate-400 hover:border-amber-400/40 hover:text-amber-300 transition-colors flex items-center justify-center gap-2 text-sm min-w-[140px]"><Mail size={15} /> Importer un email</button>
             <button onClick={() => openProjectEntry("markdown")} className="flex-1 py-3 rounded-xl border border-dashed border-app-strong text-slate-400 hover:border-amber-400/40 hover:text-amber-300 transition-colors flex items-center justify-center gap-2 text-sm min-w-[140px]"><FileText size={15} /> Importer une idée (Markdown)</button>
             <button onClick={() => openProjectEntry("batch")} className="flex-1 py-3 rounded-xl border border-dashed border-app-strong text-slate-400 hover:border-amber-400/40 hover:text-amber-300 transition-colors flex items-center justify-center gap-2 text-sm min-w-[140px]"><Users size={15} /> Importer des projets (JSON, lot)</button>
+            <button onClick={() => openProjectEntry("jsx")} className="flex-1 py-3 rounded-xl border border-dashed border-app-strong text-slate-400 hover:border-amber-400/40 hover:text-amber-300 transition-colors flex items-center justify-center gap-2 text-sm min-w-[140px]"><FileCode size={15} /> Importer un .jsx (appli déjà construite)</button>
           </div>
           {importBatchOpen && (
             <div className="mb-5 p-4 rounded-xl bg-surface border border-app space-y-3">
@@ -4891,6 +4966,15 @@ Leçons intégrées au dossier universel : ${promptAddendum ? promptAddendum.spl
               <div className="flex gap-2">{CATEGORIES.map((c) => (<button key={c} onClick={() => setImportMdCategory(c)} className={`px-3 py-1.5 rounded-full text-12 border transition-colors ${importMdCategory === c ? "bg-amber-400 text-app border-amber-400" : "border-app text-slate-400"}`}>{c}</button>))}</div>
               <textarea value={importMdRaw} onChange={(e) => setImportMdRaw(e.target.value)} rows={10} placeholder="Colle ici le Markdown ou le texte de l'idée…" className="w-full bg-surface-2 border border-app rounded-xl px-3.5 py-2.5 text-13 placeholder:text-slate-600 font-mono-data" />
               <div className="flex gap-2 justify-end"><button onClick={() => setImportMdOpen(false)} className="text-13 text-slate-500 px-3 py-1.5">Annuler</button><button onClick={importMarkdownIdea} disabled={!importMdName.trim() || !importMdRaw.trim() || importingMd} className="text-13 bg-amber-400 text-app px-3 py-1.5 rounded-lg disabled:opacity-40 flex items-center gap-2">{importingMd && <Loader2 size={14} className="animate-spin" />}{importingMd ? "Tri en cours…" : "Importer et trier"}</button></div>
+            </div>
+          )}
+          {importJsxOpen && (
+            <div className="mb-5 p-4 rounded-xl bg-surface border border-app space-y-3">
+              <p className="text-11 text-slate-500">Colle le code source (.jsx) d'une appli que tu as déjà construite. L'IA lit le code pour déduire les réponses du diagnostic — vérifie et complète ensuite dans la fiche projet. Le code est aussi conservé dans "Code existant" (mode reprise). Sur un fichier volumineux, seuls les 40 000 premiers caractères sont lus par l'IA — les réponses générées restent à relire, pas à prendre pour acquises.</p>
+              <input value={importJsxName} onChange={(e) => setImportJsxName(e.target.value)} placeholder="Nom du projet (ex. L'Œil)" className="w-full bg-surface-2 border border-app rounded-lg px-3 py-2 text-14 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+              <div className="flex gap-2">{CATEGORIES.map((c) => (<button key={c} onClick={() => setImportJsxCategory(c)} className={`px-3 py-1.5 rounded-full text-12 border transition-colors ${importJsxCategory === c ? "bg-amber-400 text-app border-amber-400" : "border-app text-slate-400"}`}>{c}</button>))}</div>
+              <textarea value={importJsxRaw} onChange={(e) => setImportJsxRaw(e.target.value)} rows={10} placeholder="Colle ici le contenu du fichier .jsx…" className="w-full bg-surface-2 border border-app rounded-xl px-3.5 py-2.5 text-11 placeholder:text-slate-600 font-mono-data" />
+              <div className="flex gap-2 justify-end"><button onClick={() => setImportJsxOpen(false)} className="text-13 text-slate-500 px-3 py-1.5">Annuler</button><button onClick={importJsxApp} disabled={!importJsxName.trim() || !importJsxRaw.trim() || importingJsx} className="text-13 bg-amber-400 text-app px-3 py-1.5 rounded-lg disabled:opacity-40 flex items-center gap-2">{importingJsx && <Loader2 size={14} className="animate-spin" />}{importingJsx ? "Lecture du code…" : "Importer et analyser le code"}</button></div>
             </div>
           )}
           {importOpen && (

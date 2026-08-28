@@ -793,16 +793,58 @@ function escapeRawControlCharsInStrings(text) {
   }
   return out;
 }
+// CORRECTIF (29/08/2026) : troisième forme d'erreur constatée avec un modèle
+// local — le JSON attendu est valide, mais le modèle ajoute du texte APRÈS
+// (une explication, un commentaire...) et ce texte parasite contient
+// lui-même un "}" ou un "]" quelque part. L'ancien découpage (du premier "{"
+// au TOUT DERNIER "}" du texte entier) incluait alors ce texte parasite dans
+// la tranche à parser, ce qui cassait un JSON par ailleurs parfaitement
+// valide ("Unexpected non-whitespace character after JSON..."). Ce scanner
+// trouve la vraie accolade/crochet de fermeture qui équilibre celui de
+// départ (en ignorant ce qui est à l'intérieur d'une chaîne), donc s'arrête
+// exactement là où le JSON se termine réellement, quoi qu'il y ait après.
+// Retourne null si aucune fermeture équilibrée n'est trouvée (réponse
+// tronquée par ex.) — extractJSON retombe alors sur l'ancien comportement.
+function extractBalancedJson(text, start) {
+  const open = text[start];
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) { escaped = false; continue; }
+      if (ch === "\\") { escaped = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === open) depth += 1;
+    else if (ch === close) { depth -= 1; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null;
+}
 function extractJSON(raw) {
   const cleaned = raw.replace(/```json|```/g, "").trim();
   const first = cleaned.indexOf("{");
   const firstArr = cleaned.indexOf("[");
   const start = first === -1 ? firstArr : (firstArr === -1 ? first : Math.min(first, firstArr));
-  const lastCurly = cleaned.lastIndexOf("}");
-  const lastSquare = cleaned.lastIndexOf("]");
-  const end = Math.max(lastCurly, lastSquare);
-  if (start === -1 || end === -1) return JSON.parse(cleaned); // laisse planter avec l'erreur d'origine si vraiment rien d'exploitable
-  const slice = cleaned.slice(start, end + 1);
+  if (start === -1) return JSON.parse(cleaned); // laisse planter avec l'erreur d'origine si vraiment rien d'exploitable
+  const balanced = extractBalancedJson(cleaned, start);
+  let slice;
+  if (balanced != null) {
+    slice = balanced;
+  } else {
+    // Repli : ancien comportement (probablement une réponse tronquée par
+    // max_tokens, sans fermeture équilibrée à trouver) — mieux qu'abandonner
+    // tout de suite, les réparations ci-dessous ont encore une chance.
+    const lastCurly = cleaned.lastIndexOf("}");
+    const lastSquare = cleaned.lastIndexOf("]");
+    const end = Math.max(lastCurly, lastSquare);
+    if (end === -1) return JSON.parse(cleaned);
+    slice = cleaned.slice(start, end + 1);
+  }
   try { return JSON.parse(slice); }
   catch (originalError) {
     const attempts = [

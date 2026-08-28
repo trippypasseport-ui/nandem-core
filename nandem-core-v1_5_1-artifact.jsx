@@ -689,6 +689,36 @@ function tryRepairJSON(text) {
     .replace(/,\s*([}\]])/g, "$1")
     .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":');
 }
+// CORRECTIF (28/08/2026) : deuxième forme d'erreur constatée avec un modèle
+// local — un saut de ligne (ou tabulation) laissé tel quel À L'INTÉRIEUR
+// d'une valeur texte du JSON (ex. un champ multi-paragraphes recopié depuis
+// un compte-rendu de session), au lieu d'être échappé en \n. Le JSON exige
+// que ces caractères de contrôle soient échappés dans une chaîne — un saut
+// de ligne brut y est toujours invalide, donc cette réparation ne peut
+// jamais transformer un JSON valide en JSON invalide. Implémenté comme un
+// petit scanner caractère par caractère (pas une regex globale) car il faut
+// savoir si on est DANS une chaîne ("...") pour ne toucher qu'à ça — un saut
+// de ligne hors chaîne (mise en forme normale du JSON) doit rester intact.
+function escapeRawControlCharsInStrings(text) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === "\\") { out += ch; escaped = true; continue; }
+      if (ch === '"') { out += ch; inString = false; continue; }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") { out += "\\r"; continue; }
+      if (ch === "\t") { out += "\\t"; continue; }
+      out += ch;
+    } else {
+      if (ch === '"') inString = true;
+      out += ch;
+    }
+  }
+  return out;
+}
 function extractJSON(raw) {
   const cleaned = raw.replace(/```json|```/g, "").trim();
   const first = cleaned.indexOf("{");
@@ -701,8 +731,15 @@ function extractJSON(raw) {
   const slice = cleaned.slice(start, end + 1);
   try { return JSON.parse(slice); }
   catch (originalError) {
-    try { return JSON.parse(tryRepairJSON(slice)); }
-    catch { throw originalError; } // la réparation a aussi échoué — remonte l'erreur d'origine, plus utile pour diagnostiquer
+    const attempts = [
+      tryRepairJSON(slice),
+      escapeRawControlCharsInStrings(slice),
+      tryRepairJSON(escapeRawControlCharsInStrings(slice)),
+    ];
+    for (const attempt of attempts) {
+      try { return JSON.parse(attempt); } catch {}
+    }
+    throw originalError; // toutes les réparations ont échoué — remonte l'erreur d'origine, plus utile pour diagnostiquer
   }
 }
 async function relanceVague(goal, answer) {

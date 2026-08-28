@@ -564,12 +564,22 @@ let ANTHROPIC_API_KEY = null;
 // n'importe quelle IA". LM Studio et "custom" n'ont de sens qu'en local (le
 // relais tourne sur la machine du porteur) : hors localhost, on retombe
 // toujours sur Anthropic quel que soit ce réglage.
-let AI_PROVIDER = "anthropic";
+// CORRECTIF (28/08/2026) : LM Studio par défaut au lieu d'Anthropic — demande
+// du porteur ("par défaut mets LM Studio"), cohérent avec le fait que LM
+// Studio ne coûte rien et ne demande aucune clé. Ne change rien pour un
+// porteur qui a déjà choisi un fournisseur : cette valeur n'est utilisée
+// qu'avant le chargement des réglages sauvegardés (voir plus bas,
+// setAiProvider(loadedSettings.aiProvider) écrase cette valeur dès que les
+// réglages sont lus).
+let AI_PROVIDER = "lmstudio";
 let CUSTOM_AI_BASE_URL = null;
 let CUSTOM_AI_MODEL = null;
 let CUSTOM_AI_KEY = null;
 function setAnthropicApiKey(key) { ANTHROPIC_API_KEY = key || null; }
-function setAiProvider(provider) { AI_PROVIDER = ["lmstudio", "custom"].includes(provider) ? provider : "anthropic"; }
+// CORRECTIF (28/08/2026) : repli sur "lmstudio" (au lieu de "anthropic") pour
+// une valeur invalide ou absente — cohérent avec le nouveau défaut ci-dessus.
+// "anthropic" explicite continue de fonctionner normalement.
+function setAiProvider(provider) { AI_PROVIDER = ["anthropic", "lmstudio", "custom"].includes(provider) ? provider : "lmstudio"; }
 function setCustomAiConfig({ baseUrl, model, apiKey } = {}) { CUSTOM_AI_BASE_URL = baseUrl || null; CUSTOM_AI_MODEL = model || null; CUSTOM_AI_KEY = apiKey || null; }
 // AJOUT (28/08/2026) : plusieurs profils "API compatible OpenAI" (DeepSeek,
 // OpenAI, Mistral...) au lieu d'un seul — demande explicite du porteur après
@@ -3616,7 +3626,7 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
   // ne pas être dépendant d'une IA en particulier". Change en un clic, sans
   // toucher au code ni relancer le serveur (le relais lit ce choix via un
   // en-tête à chaque appel, cf callAnthropic()).
-  const [aiProvider, setAiProviderInput] = useState(settings.aiProvider || "anthropic");
+  const [aiProvider, setAiProviderInput] = useState(settings.aiProvider || "lmstudio");
   const [providerSaved, setProviderSaved] = useState(false);
   // Fournisseur générique "API compatible OpenAI" (27/08/2026) — un 3e choix
   // qui couvre n'importe quel service parlant ce format (OpenAI, Mistral,
@@ -3909,30 +3919,42 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
           </div>
         )}
       </div>
-      <div className="p-4 rounded-xl bg-surface border border-red-400/30 mb-5">
-        <div className="flex items-center justify-between mb-2">
-          <p className="text-11 uppercase tracking-wider text-red-300">API Anthropic — pour déploiement hors Claude uniquement</p>
-          {!editingApiKey && <button onClick={() => setEditingApiKey(true)} className="p-1.5 rounded-lg hover:bg-surface-2 text-slate-400 hover:text-amber-300 shrink-0" title="Modifier"><Pencil size={13} /></button>}
+      {/* CORRECTIF (28/08/2026) : n'affiche cette carte "clé API" que si le
+          fournisseur actif en a réellement besoin (Anthropic) — demande du
+          porteur : "si j'appuie sur ceux qui ne nécessitent pas de clé API,
+          la clé ne s'affiche pas [...] comme ça d'un coup d'œil je vois sur
+          quel API je suis". LM Studio n'a besoin d'aucune clé (local,
+          gratuit) ; le fournisseur "API compatible OpenAI" a déjà sa propre
+          carte de clé(s), visible seulement quand lui-même est actif (juste
+          au-dessus). Avant ce correctif, cette carte restait visible en
+          permanence quelle que soit la sélection, ce qui ne permettait pas
+          de voir en un coup d'œil quel fournisseur est réellement actif. */}
+      {aiProvider === "anthropic" && (
+        <div className="p-4 rounded-xl bg-surface border border-red-400/30 mb-5">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-11 uppercase tracking-wider text-red-300">API Anthropic — pour déploiement hors Claude uniquement</p>
+            {!editingApiKey && <button onClick={() => setEditingApiKey(true)} className="p-1.5 rounded-lg hover:bg-surface-2 text-slate-400 hover:text-amber-300 shrink-0" title="Modifier"><Pencil size={13} /></button>}
+          </div>
+          {editingApiKey ? (
+            <>
+              <p className="text-11 text-slate-400 mb-3 leading-relaxed">
+                Nécessaire seulement si tu déploies cette appli hors de l'aperçu Claude (ex. CodeSandbox), où l'appel API n'a plus d'authentification automatique.
+                ⚠️ Cette clé sera visible dans le navigateur de quiconque ouvre la page déployée (inspecteur réseau) — <span className="text-red-300">ne jamais la renseigner sur une version dont le lien circule publiquement ou est envoyé à des clients</span>. Réservé à tes tests privés.
+              </p>
+              <div className="flex gap-2 mb-3">
+                <input type={showKey ? "text" : "password"} value={apiKeyInput} onChange={(e) => setApiKeyInput(e.target.value)} placeholder="sk-ant-..." className="flex-1 bg-surface-2 border border-app rounded-lg px-3 py-2 text-13 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+                <button onClick={() => setShowKey(!showKey)} className="px-3 rounded-lg bg-surface-2 border border-app text-slate-400 text-12 shrink-0">{showKey ? "Cacher" : "Voir"}</button>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={saveKey} className="text-13 bg-amber-400 text-app px-4 py-1.5 rounded-lg">{apiSaved ? "Enregistrée" : "Enregistrer la clé"}</button>
+                {apiKey && <button onClick={() => { setApiKeyInput(""); onSaveApiKey(""); setEditingApiKey(true); }} className="text-13 text-red-300 px-4 py-1.5">Retirer</button>}
+              </div>
+            </>
+          ) : (
+            <p className="text-12 text-slate-400">Une clé est actuellement enregistrée sur cet appareil.</p>
+          )}
         </div>
-        {editingApiKey ? (
-          <>
-            <p className="text-11 text-slate-400 mb-3 leading-relaxed">
-              Nécessaire seulement si tu déploies cette appli hors de l'aperçu Claude (ex. CodeSandbox), où l'appel API n'a plus d'authentification automatique.
-              ⚠️ Cette clé sera visible dans le navigateur de quiconque ouvre la page déployée (inspecteur réseau) — <span className="text-red-300">ne jamais la renseigner sur une version dont le lien circule publiquement ou est envoyé à des clients</span>. Réservé à tes tests privés.
-            </p>
-            <div className="flex gap-2 mb-3">
-              <input type={showKey ? "text" : "password"} value={apiKeyInput} onChange={(e) => setApiKeyInput(e.target.value)} placeholder="sk-ant-..." className="flex-1 bg-surface-2 border border-app rounded-lg px-3 py-2 text-13 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
-              <button onClick={() => setShowKey(!showKey)} className="px-3 rounded-lg bg-surface-2 border border-app text-slate-400 text-12 shrink-0">{showKey ? "Cacher" : "Voir"}</button>
-            </div>
-            <div className="flex gap-2">
-              <button onClick={saveKey} className="text-13 bg-amber-400 text-app px-4 py-1.5 rounded-lg">{apiSaved ? "Enregistrée" : "Enregistrer la clé"}</button>
-              {apiKey && <button onClick={() => { setApiKeyInput(""); onSaveApiKey(""); setEditingApiKey(true); }} className="text-13 text-red-300 px-4 py-1.5">Retirer</button>}
-            </div>
-          </>
-        ) : (
-          <p className="text-12 text-slate-400">Une clé est actuellement enregistrée sur cet appareil.</p>
-        )}
-      </div>
+      )}
       <button onClick={onReplayOnboarding} className="w-full py-2.5 rounded-xl bg-surface-2 border border-app text-sm text-slate-300 hover:border-amber-400/30 transition-colors flex items-center justify-center gap-2"><HelpCircle size={15} /> Revoir l'introduction</button>
     </div>
   );
@@ -4491,7 +4513,7 @@ function AdminApp({ theme, setTheme }) {
   const [loaded, setLoaded] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [clientLinkFallback, setClientLinkFallback] = useState(null);
-  const [settings, setSettings] = useState({ studioName: PLACEHOLDER_STUDIO, feedbackEmail: PLACEHOLDER_EMAIL, aiProvider: "anthropic" });
+  const [settings, setSettings] = useState({ studioName: PLACEHOLDER_STUDIO, feedbackEmail: PLACEHOLDER_EMAIL, aiProvider: "lmstudio" });
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [customGoals, setCustomGoals] = useState([]);
   const [apiKey, setApiKeyState] = useState(null);

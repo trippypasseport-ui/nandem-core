@@ -571,6 +571,39 @@ let CUSTOM_AI_KEY = null;
 function setAnthropicApiKey(key) { ANTHROPIC_API_KEY = key || null; }
 function setAiProvider(provider) { AI_PROVIDER = ["lmstudio", "custom"].includes(provider) ? provider : "anthropic"; }
 function setCustomAiConfig({ baseUrl, model, apiKey } = {}) { CUSTOM_AI_BASE_URL = baseUrl || null; CUSTOM_AI_MODEL = model || null; CUSTOM_AI_KEY = apiKey || null; }
+// AJOUT (28/08/2026) : plusieurs profils "API compatible OpenAI" (DeepSeek,
+// OpenAI, Mistral...) au lieu d'un seul — demande explicite du porteur après
+// avoir configuré DeepSeek : "si jamais je veux mettre l'api de openai ou
+// une autre je voudrais avoir plusieurs choix possible en fonction de mes
+// clés". Bascule en un clic sans ressaisir une clé déjà enregistrée. Fonctions
+// pures et testables isolément (aucun accès à window.storage ici) — la partie
+// React (ReglagesView + AdminApp) ne fait que les appeler et persister le
+// résultat, comme le reste de l'app.
+//
+// Chaque profil : { id, name, baseUrl, model } — SANS la clé, qui reste
+// stockée à part (nandem-custom-ai-key:<id>), jamais dans les réglages
+// publics ni dans un export, comme la clé Anthropic et l'ancienne clé
+// "custom" unique.
+function migrateLegacyCustomAiProfile(settings) {
+  // Si des profils existent déjà, rien à migrer. Sinon, si l'ancien format
+  // à un seul fournisseur (customAiBaseUrl) contient quelque chose, en fait
+  // le premier profil — pour ne jamais perdre une config déjà en place
+  // (ex. DeepSeek) au moment de ce correctif. Retourne null si rien à migrer.
+  if (Array.isArray(settings?.customAiProfiles) && settings.customAiProfiles.length) return null;
+  if (!settings?.customAiBaseUrl) return null;
+  return { id: genId(), name: "Fournisseur personnalisé", baseUrl: settings.customAiBaseUrl, model: settings.customAiModel || "" };
+}
+function upsertCustomAiProfile(profiles, profile) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  const idx = list.findIndex((p) => p.id === profile.id);
+  if (idx === -1) return [...list, profile];
+  const next = list.slice();
+  next[idx] = profile;
+  return next;
+}
+function removeCustomAiProfile(profiles, id) {
+  return (Array.isArray(profiles) ? profiles : []).filter((p) => p.id !== id);
+}
 function anthropicHeaders(base) {
   return ANTHROPIC_API_KEY
     ? { ...base, "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }
@@ -605,7 +638,22 @@ function useLocalAiRelay() {
   if (host.endsWith(".local")) return true; // ex. MacBook-Air-de-fereol.local, résolu par Bonjour/mDNS
   return false;
 }
-async function callAnthropic(body) {
+// AJOUT (28/08/2026) : deuxième paramètre expectJson — quand true, et
+// uniquement pour un relais local (LM Studio / "custom", jamais Anthropic,
+// jamais le chemin distant), ajoute l'en-tête x-nandem-expect-json. Les
+// relais locaux (nandem-ai-relay.mjs et vite.config.js) s'en servent pour
+// activer le mode JSON strict de l'API compatible OpenAI
+// (response_format: {type:"json_object"}) quand le modèle le supporte —
+// ça réduit fortement (sans l'éliminer) le risque de JSON malformé en
+// sortie, en complément des réparations heuristiques d'extractJSON (déjà en
+// place). Le format Anthropic envoyé par callAnthropic() ne change pas :
+// cet en-tête est ignoré par l'API Anthropic elle-même (jamais atteinte
+// quand expectJson est utile, puisque c'est un besoin propre aux modèles
+// locaux moins fiables sur le JSON). Statut Prometteur : correct par
+// construction, dépend du support response_format par le serveur local
+// (LM Studio le supporte depuis ses versions récentes ; un serveur qui
+// l'ignore silencieusement se comporte comme avant, sans régression).
+async function callAnthropic(body, expectJson = false) {
   const local = useLocalAiRelay();
   const response = await fetch(local ? "/__nandem_ai" : "https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -613,6 +661,7 @@ async function callAnthropic(body) {
       ? {
           "Content-Type": "application/json",
           "x-nandem-ai-provider": AI_PROVIDER,
+          ...(expectJson ? { "x-nandem-expect-json": "1" } : {}),
           ...(ANTHROPIC_API_KEY ? { "x-nandem-api-key": ANTHROPIC_API_KEY } : {}),
           ...(AI_PROVIDER === "custom" ? {
             "x-nandem-custom-base-url": CUSTOM_AI_BASE_URL || "",
@@ -633,10 +682,25 @@ async function callAnthropic(body) {
   }
   return response;
 }
-async function askClaude(userContent, maxTokens = 1500) {
-  const response = await callAnthropic({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: userContent }] });
+async function askClaude(userContent, maxTokens = 1500, expectJson = false) {
+  const response = await callAnthropic({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: userContent }] }, expectJson);
   const data = await response.json();
   return data.content.map((b) => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n").trim();
+}
+// AJOUT (28/08/2026) : point d'entrée unique pour tout appel IA dont la
+// réponse DOIT être du JSON exploitable par le moteur (les ~16 sites qui
+// faisaient jusqu'ici extractJSON(await askClaude(prompt, N)) un par un).
+// Centralise : (1) le signalement expectJson au relais local pour activer
+// response_format côté LM Studio/custom, (2) l'extraction/réparation via
+// extractJSON (inchangée, toujours nécessaire — le mode JSON strict d'un
+// serveur local garantit un JSON syntaxiquement valide mais pas la présence
+// des bons champs, et Anthropic n'a pas cet en-tête du tout). Ne remplace
+// PAS les 3 sites qui parsent du texte collé à la main par le porteur
+// (Mode Assistant bêta) : là il n'y a pas d'appel IA à configurer, donc pas
+// de gain possible — ils continuent d'utiliser extractJSON directement.
+async function askClaudeJSON(userContent, maxTokens = 1500) {
+  const raw = await askClaude(userContent, maxTokens, true);
+  return extractJSON(raw);
 }
 
 // Les conceptions techniques peuvent dépasser la limite de sortie d'un seul
@@ -768,7 +832,7 @@ Réponds UNIQUEMENT avec un objet JSON : {"utilisable": true ou false, "relance"
 Si utilisable est false : "relance" est UNE question de clarification, maximum 20 mots, sans proposer de solution.
 Si utilisable est true : "relance" est une chaîne vide.`;
   try {
-    const parsed = extractJSON(await askClaude(prompt, 200));
+    const parsed = await askClaudeJSON(prompt, 200);
     return { ok: !!parsed.utilisable, relance: (parsed.relance || "").trim() };
   } catch {
     // Échec réseau/parsing : ne jamais bloquer la personne à cause d'un problème technique de notre côté.
@@ -785,7 +849,7 @@ Texte de la personne :
 "${text}"
 
 Indique UNIQUEMENT les sujets que ce texte couvre déjà clairement, avec une reformulation fidèle de sa réponse (pas un copier-coller brut, mais rien d'inventé). Ignore tout sujet non abordé — ne force rien. Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}, vide ({}) si rien n'est clairement couvert.`;
-  try { return extractJSON(await askClaude(prompt, 1200)); } catch { return {}; }
+  try { return await askClaudeJSON(prompt, 1200); } catch { return {}; }
 }
 async function extractFromDocuments(contentBlocks, extraTextNotes, allGoals) {
   if (!contentBlocks.length && !extraTextNotes?.trim()) return {};
@@ -796,7 +860,7 @@ ${extraTextNotes?.trim() ? `\nNotes texte fournies en plus :\n${extraTextNotes.t
 Indique UNIQUEMENT les sujets que ces documents couvrent déjà clairement. Reformule dans tes propres mots, ne recopie jamais de texte verbatim. Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}, vide ({}) si rien n'est exploitable.`;
   const content = [...contentBlocks, { type: "text", text: instructionText }];
   try {
-    const response = await callAnthropic({ model: "claude-sonnet-4-6", max_tokens: 2000, messages: [{ role: "user", content }] });
+    const response = await callAnthropic({ model: "claude-sonnet-4-6", max_tokens: 2000, messages: [{ role: "user", content }] }, true);
     const data = await response.json();
     const raw = data.content.map((b) => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n").trim();
     return extractJSON(raw);
@@ -817,8 +881,7 @@ ${transcript}${extra}${conversationBlock}`;
 }
 async function buildSynthesis(answers, rawConversation) {
   const prompt = buildSynthesisPrompt(answers, rawConversation);
-  const raw = await askClaude(prompt, 3000);
-  return extractJSON(raw);
+  return await askClaudeJSON(prompt, 3000);
 }
 // Document commercial à envoyer au client — distinct de la conception
 // technique (destinée à Claude Code). Ici : ce qu'on a compris, ce qui est
@@ -1008,7 +1071,7 @@ Besoin réel : ${synthesis.besoinReel}
 Fonctionnalités V1 déjà prévues : ${synthesis.fonctionnalitesV1}
 Contraintes : ${synthesis.contraintes}
 Complexité : ${synthesis.complexite}`;
-  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return []; }
+  try { return await askClaudeJSON(prompt, 1500); } catch { return []; }
 }
 async function detectPatterns(libraryEntries) {
   const truncated = libraryEntries.length > MAX_PATTERN_LIBRARY_ENTRIES;
@@ -1027,7 +1090,7 @@ niveauConfiance :
 Si rien de solide, réponds [].
 
 ${dump}`;
-  try { return { proposals: extractJSON(await askClaude(prompt, 2000)), truncated }; }
+  try { return { proposals: await askClaudeJSON(prompt, 2000), truncated }; }
   catch { return { proposals: [], truncated }; }
 }
 // Chat conversationnel pour affiner le promptAddendum — contrairement aux
@@ -1063,7 +1126,7 @@ Ne classe jamais "Établi" à partir de ces observations. Plusieurs projets fict
 
 OBSERVATIONS :
 ${dump}`;
-  const result = extractJSON(await askClaude(prompt, 3500));
+  const result = await askClaudeJSON(prompt, 3500);
   if (!Array.isArray(result)) throw new Error("La formalisation n’a pas renvoyé un tableau valide.");
   const scopes = new Set(["universel", "categorie", "famille", "secteur", "specifique"]);
   return result.filter((item) => item && typeof item.label === "string" && typeof (item.instruction || item.synthese) === "string").map((item) => ({
@@ -1097,7 +1160,7 @@ Texte à trier :
 """${markdownText.slice(0, 20000)}"""
 
 Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}, vide ({}) si rien de pertinent au projet n'est présent. Ne reformule que ce qui concerne clairement le projet — jamais le reste.`;
-  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return {}; }
+  try { return await askClaudeJSON(prompt, 1500); } catch { return {}; }
 }
 // AJOUT (27/08/2026) : import direct d'une appli déjà construite à partir de
 // son code source (.jsx) — demandé par le porteur pour enregistrer des
@@ -1122,7 +1185,7 @@ Code source (peut être tronqué si l'appli est volumineuse — base-toi uniquem
 """${codeText.slice(0, 40000)}"""
 
 Réponds UNIQUEMENT avec un objet JSON {"id": "réponse reformulée", ...}. N'inclus que les id pour lesquels le code donne une réponse réellement déductible — laisse de côté ce qui n'est pas visible plutôt que de deviner.`;
-  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return {}; }
+  try { return await askClaudeJSON(prompt, 1500); } catch { return {}; }
 }
 async function chatAboutMdImport(history, addendum) {
   const transcript = history.map((m) => `${m.role === "user" ? "Utilisateur" : "Assistant"} : ${m.text}`).join("\n\n");
@@ -1148,7 +1211,7 @@ ${summary}
 Propose 3 à 5 pistes concrètes pour optimiser cette activité (tarification, relance commerciale, priorités, ce qui semble sous-exploité ou négligé). Reste concret et actionnable à partir des chiffres donnés — pas de généralités de coach business, pas de conseil que ces chiffres ne soutiennent pas.
 Produis UNIQUEMENT un tableau JSON, chaque élément avec : label (court), description (2-3 phrases, pourquoi c'est pertinent ICI vu les chiffres), niveauConfiance (Hypothèse — jamais Établi à partir de si peu de données).
 Si les chiffres sont trop pauvres pour dire quoi que ce soit d'utile, réponds [].`;
-  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return []; }
+  try { return await askClaudeJSON(prompt, 1500); } catch { return []; }
 }
 async function detectPromptFeedbackPatterns(feedbackEntries) {
   if (feedbackEntries.length < 2) return [];
@@ -1158,7 +1221,7 @@ Produis UNIQUEMENT un tableau JSON, chaque élément avec : label (court), descr
 Si rien de solide, réponds [].
 
 ${dump}`;
-  try { return extractJSON(await askClaude(prompt, 1500)); } catch { return []; }
+  try { return await askClaudeJSON(prompt, 1500); } catch { return []; }
 }
 
 async function analyzeQuestionnaireAnswers(samples, goalsByFamily) {
@@ -1177,7 +1240,7 @@ ${JSON.stringify(goalsByFamily)}
 
 Échantillon anonymisé de ${samples.length} diagnostics (réponses finales + conversation brute assainie) :
 ${JSON.stringify(samples).slice(0, 70000)}`;
-  const result = extractJSON(await askClaude(prompt, 3500));
+  const result = await askClaudeJSON(prompt, 3500);
   if (!Array.isArray(result)) throw new Error("L’analyse du questionnaire n’a pas renvoyé un tableau valide.");
   const validIds = new Set([...goalsByFamily.app, ...goalsByFamily.entreprise].map((goal) => goal.id));
   return result.filter((item) => item && validIds.has(item.goalId) && ["app", "entreprise"].includes(item.questionnaire) && typeof item.questionProposee === "string" && item.questionProposee.trim()).map((item) => ({
@@ -1252,7 +1315,7 @@ function parseVerificationResponse(result) {
 }
 async function verifyGeneratedResult(referencePrompt, generatedResult) {
   const prompt = buildVerificationPrompt(referencePrompt, generatedResult);
-  return parseVerificationResponse(extractJSON(await askClaude(prompt, 4000)));
+  return parseVerificationResponse(await askClaudeJSON(prompt, 4000));
 }
 
 function buildBuilderDebriefPrompt(realization) {
@@ -1301,7 +1364,7 @@ ${buildBuilderDebriefPrompt(realization).slice(0, 30000)}
 
 RÉPONSE DE L’IA CONSTRUCTRICE :
 ${String(response).slice(0, 40000)}`;
-  const result = extractJSON(await askClaude(prompt, 2500));
+  const result = await askClaudeJSON(prompt, 2500);
   if (!result || typeof result.learningProposal !== "string" || !result.learningProposal.trim()) throw new Error("La synthèse du débrief n’a pas renvoyé une proposition valide.");
   return {
     learningProposal: result.learningProposal.trim(), scope: ["universelle", "famille", "projet"].includes(result.scope) ? result.scope : "projet",
@@ -1328,7 +1391,7 @@ niveauConfiance :
 Si rien de solide, réponds [].
 
 ${dump}`;
-  try { return { proposals: extractJSON(await askClaude(prompt, 2000)), scanned: projects.length }; }
+  try { return { proposals: await askClaudeJSON(prompt, 2000), scanned: projects.length }; }
   catch { return { proposals: [], scanned: projects.length }; }
 }
 
@@ -1398,7 +1461,7 @@ Niveaux possibles :
 - generique : mécanisme probablement universel, candidat à devenir une règle du moteur.
 
 Réponds UNIQUEMENT avec un objet JSON : {"niveau": "specifique|metier|transversal|generique", "raison": "une phrase courte"}. Dans le doute, reste sur "specifique" — ne surestime jamais la portée à partir d'un seul exemple.`;
-  try { return extractJSON(await askClaude(prompt, 300)); } catch { return null; }
+  try { return await askClaudeJSON(prompt, 300); } catch { return null; }
 }
 const LIB_TYPES = [
   { id: "connaissance", label: "Connaissance" },
@@ -3511,7 +3574,7 @@ function LibraryView({ library, onRemove, onAcceptProposal, onPromote, onScanPro
     </div>
   );
 }
-function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, apiKey, onSaveApiKey, customAiKey, onSaveCustomAiKey, onExportAll, onImportAll }) {
+function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, apiKey, onSaveApiKey, onSaveCustomAiProfile, onDeleteCustomAiProfile, onActivateCustomAiProfile, onExportAll, onImportAll }) {
   const [studioName, setStudioName] = useState(settings.studioName);
   const [feedbackEmail, setFeedbackEmail] = useState(settings.feedbackEmail);
   const [bio, setBio] = useState(settings.bio || "");
@@ -3536,11 +3599,24 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
   // qui couvre n'importe quel service parlant ce format (OpenAI, Mistral,
   // Groq, OpenRouter, DeepSeek...) via une URL de base + une clé + un modèle,
   // au lieu de coder chaque fournisseur un par un.
-  const [customAiBaseUrl, setCustomAiBaseUrl] = useState(settings.customAiBaseUrl || "");
-  const [customAiModel, setCustomAiModel] = useState(settings.customAiModel || "");
-  const [customAiKeyInput, setCustomAiKeyInput] = useState(customAiKey || "");
-  const [customAiSaved, setCustomAiSaved] = useState(false);
+  // CORRECTIF (28/08/2026) : plusieurs profils enregistrables au lieu d'un
+  // seul — demande du porteur après avoir configuré DeepSeek : pouvoir
+  // ajouter OpenAI (ou un autre) sans perdre/écraser la config existante, et
+  // basculer entre eux en un clic. customAiProfiles/activeCustomProfileId
+  // viennent des réglages publics (settings) — la clé de chaque profil,
+  // elle, ne transite jamais par ce state global (voir profileFormKey
+  // ci-dessous, propre au formulaire d'ajout/modification).
+  const customAiProfiles = settings.customAiProfiles || [];
+  const activeCustomProfileId = settings.activeCustomProfileId || null;
+  const [profileFormOpen, setProfileFormOpen] = useState(false);
+  const [profileFormId, setProfileFormId] = useState(null); // null = nouveau profil
+  const [profileFormName, setProfileFormName] = useState("");
+  const [profileFormBaseUrl, setProfileFormBaseUrl] = useState("");
+  const [profileFormModel, setProfileFormModel] = useState("");
+  const [profileFormKey, setProfileFormKey] = useState("");
   const [showCustomKey, setShowCustomKey] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [deleteProfileConfirmId, setDeleteProfileConfirmId] = useState(null);
   const [apiKeyInput, setApiKeyInput] = useState(apiKey || "");
   const [apiSaved, setApiSaved] = useState(false);
   const [showKey, setShowKey] = useState(false);
@@ -3568,7 +3644,13 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
       tarifMoyenne: tarifMoyenne === "" ? null : Number(tarifMoyenne),
       tarifElevee: tarifElevee === "" ? null : Number(tarifElevee),
       tarifHoraire: tarifHoraire === "" ? null : Number(tarifHoraire),
-      aiProvider, customAiBaseUrl, customAiModel,
+      aiProvider,
+      // customAiProfiles/activeCustomProfileId (28/08/2026) ne sont plus
+      // recalculés depuis un state local ici — ils vivent dans settings et
+      // sont modifiés uniquement via onSaveCustomAiProfile/onDeleteCustomAiProfile/
+      // onActivateCustomAiProfile, jamais réécrits en passant par ce payload
+      // générique (qui écraserait sinon la liste avec une valeur obsolète).
+      customAiProfiles: settings.customAiProfiles, activeCustomProfileId: settings.activeCustomProfileId,
       ...overrides,
     };
   }
@@ -3576,13 +3658,38 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
   function saveTarifs() { onSave(buildSettingsPayload()); setSaved(true); setEditingTarifs(false); setTimeout(() => setSaved(false), 1500); }
   function saveKey() { onSaveApiKey(apiKeyInput.trim()); setApiSaved(true); setEditingApiKey(false); setTimeout(() => setApiSaved(false), 1500); }
   function saveProvider(next) { setAiProviderInput(next); onSave(buildSettingsPayload({ aiProvider: next })); setProviderSaved(true); setTimeout(() => setProviderSaved(false), 1500); }
-  // Enregistre en un clic l'URL de base + le modèle (réglages publics) ET la
-  // clé (stockage séparé, cf onSaveCustomAiKey) — les trois sont nécessaires
-  // ensemble pour qu'un appel "custom" fonctionne.
-  function saveCustomAi() {
-    onSave(buildSettingsPayload({ customAiBaseUrl: customAiBaseUrl.trim(), customAiModel: customAiModel.trim() }));
-    onSaveCustomAiKey(customAiKeyInput.trim());
-    setCustomAiSaved(true); setTimeout(() => setCustomAiSaved(false), 1500);
+  // AJOUT (28/08/2026) : formulaire d'ajout/modification d'un profil
+  // "API compatible OpenAI". openProfileForm(null) = nouveau profil (champs
+  // vides) ; openProfileForm(profile) = modification (champs pré-remplis,
+  // clé rechargée à part car jamais gardée dans settings/customAiProfiles).
+  async function openProfileForm(profile) {
+    if (profile) {
+      setProfileFormId(profile.id);
+      setProfileFormName(profile.name || "");
+      setProfileFormBaseUrl(profile.baseUrl || "");
+      setProfileFormModel(profile.model || "");
+      setProfileFormKey(""); // laissé vide : "Enregistrer" sans y toucher garde la clé actuelle
+    } else {
+      setProfileFormId(null);
+      setProfileFormName(""); setProfileFormBaseUrl(""); setProfileFormModel(""); setProfileFormKey("");
+    }
+    setShowCustomKey(false);
+    setProfileFormOpen(true);
+  }
+  function cancelProfileForm() { setProfileFormOpen(false); setProfileFormId(null); }
+  async function submitProfileForm() {
+    if (!profileFormBaseUrl.trim()) return;
+    setProfileSaving(true);
+    try {
+      await onSaveCustomAiProfile({ id: profileFormId, name: profileFormName, baseUrl: profileFormBaseUrl, model: profileFormModel, apiKey: profileFormKey });
+      setProfileFormOpen(false); setProfileFormId(null);
+    } finally { setProfileSaving(false); }
+  }
+  async function confirmDeleteProfile(id) {
+    if (deleteProfileConfirmId !== id) { setDeleteProfileConfirmId(id); return; }
+    await onDeleteCustomAiProfile(id);
+    setDeleteProfileConfirmId(null);
+    if (profileFormId === id) { setProfileFormOpen(false); setProfileFormId(null); }
   }
   async function doExport() {
     setExporting(true);
@@ -3736,17 +3843,46 @@ function ReglagesView({ settings, onSave, onReplayOnboarding, theme, setTheme, a
         {providerSaved && <p className="text-11 text-amber-300 mb-2">Enregistré.</p>}
         {aiProvider === "custom" && (
           <div className="mt-3 pt-3 border-t border-app-soft">
-            <label className="text-12 text-slate-500 block mb-1">URL de base (format OpenAI, sans /chat/completions)</label>
-            <input value={customAiBaseUrl} onChange={(e) => setCustomAiBaseUrl(e.target.value)} placeholder="Ex : https://api.openai.com/v1 ou https://openrouter.ai/api/v1" className="w-full bg-surface-2 border border-app rounded-lg px-3 py-2 text-13 mb-3 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
-            <label className="text-12 text-slate-500 block mb-1">Modèle (facultatif — nécessaire pour la plupart des fournisseurs hors LM Studio)</label>
-            <input value={customAiModel} onChange={(e) => setCustomAiModel(e.target.value)} placeholder="Ex : gpt-4o-mini, mistral-large-latest..." className="w-full bg-surface-2 border border-app rounded-lg px-3 py-2 text-13 mb-3 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
-            <label className="text-12 text-slate-500 block mb-1">Clé API</label>
-            <div className="flex gap-2 mb-3">
-              <input type={showCustomKey ? "text" : "password"} value={customAiKeyInput} onChange={(e) => setCustomAiKeyInput(e.target.value)} placeholder="sk-..." className="flex-1 bg-surface-2 border border-app rounded-lg px-3 py-2 text-13 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
-              <button onClick={() => setShowCustomKey(!showCustomKey)} className="px-3 rounded-lg bg-surface-2 border border-app text-slate-400 text-12 shrink-0">{showCustomKey ? "Cacher" : "Voir"}</button>
-            </div>
-            <p className="text-10 text-red-300 mb-3">⚠️ Comme la clé Anthropic, visible dans le navigateur si l'appli est déployée publiquement — réservé à tes tests privés.</p>
-            <button onClick={saveCustomAi} className="text-13 bg-amber-400 text-app px-4 py-1.5 rounded-lg">{customAiSaved ? "Enregistré" : "Enregistrer"}</button>
+            {/* AJOUT (28/08/2026) : plusieurs profils enregistrables (DeepSeek,
+                OpenAI, Mistral...) au lieu d'un seul — bascule en un clic sans
+                ressaisir de clé. */}
+            <p className="text-12 text-slate-500 mb-2">Fournisseurs enregistrés — clique sur un nom pour l'activer.</p>
+            {customAiProfiles.length > 0 && (
+              <div className="flex flex-wrap gap-2 mb-2">
+                {customAiProfiles.map((p) => (
+                  <div key={p.id} className={`flex items-center gap-0.5 pl-3 pr-1.5 py-1.5 rounded-lg border text-12 ${p.id === activeCustomProfileId ? "bg-amber-400 text-app border-amber-400" : "border-app text-slate-300"}`}>
+                    <button onClick={() => onActivateCustomAiProfile(p.id)} className="font-medium max-w-[140px] truncate" title={p.baseUrl}>{p.name}</button>
+                    <button onClick={() => openProfileForm(p)} className="p-1 rounded hover:bg-black/10 shrink-0" title="Modifier"><Pencil size={11} /></button>
+                    <button onClick={() => confirmDeleteProfile(p.id)} className="p-1 rounded hover:bg-black/10 shrink-0" title="Supprimer">
+                      {deleteProfileConfirmId === p.id ? <span className="text-10 px-1">Confirmer ?</span> : <Trash2 size={11} />}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!profileFormOpen && (
+              <button onClick={() => openProfileForm(null)} className="text-13 text-slate-400 hover:text-amber-300 transition-colors mb-2">+ Ajouter un fournisseur</button>
+            )}
+            {profileFormOpen && (
+              <div className="p-3 rounded-lg bg-surface-2 border border-app mb-2">
+                <label className="text-12 text-slate-500 block mb-1">Nom (ex : DeepSeek, OpenAI, Mistral)</label>
+                <input value={profileFormName} onChange={(e) => setProfileFormName(e.target.value)} placeholder="Ex : OpenAI" className="w-full bg-surface border border-app rounded-lg px-3 py-2 text-13 mb-3 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+                <label className="text-12 text-slate-500 block mb-1">URL de base (format OpenAI, sans /chat/completions)</label>
+                <input value={profileFormBaseUrl} onChange={(e) => setProfileFormBaseUrl(e.target.value)} placeholder="Ex : https://api.openai.com/v1 ou https://api.deepseek.com/v1" className="w-full bg-surface border border-app rounded-lg px-3 py-2 text-13 mb-3 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+                <label className="text-12 text-slate-500 block mb-1">Modèle (facultatif — nécessaire pour la plupart des fournisseurs hors LM Studio)</label>
+                <input value={profileFormModel} onChange={(e) => setProfileFormModel(e.target.value)} placeholder="Ex : gpt-4o-mini, deepseek-chat..." className="w-full bg-surface border border-app rounded-lg px-3 py-2 text-13 mb-3 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+                <label className="text-12 text-slate-500 block mb-1">Clé API{profileFormId ? " (laisser vide pour garder la clé déjà enregistrée)" : ""}</label>
+                <div className="flex gap-2 mb-3">
+                  <input type={showCustomKey ? "text" : "password"} value={profileFormKey} onChange={(e) => setProfileFormKey(e.target.value)} placeholder="sk-..." className="flex-1 bg-surface border border-app rounded-lg px-3 py-2 text-13 focus:outline-none focus:ring-1 focus:ring-amber-400/40" />
+                  <button onClick={() => setShowCustomKey(!showCustomKey)} className="px-3 rounded-lg bg-surface border border-app text-slate-400 text-12 shrink-0">{showCustomKey ? "Cacher" : "Voir"}</button>
+                </div>
+                <p className="text-10 text-red-300 mb-3">⚠️ Comme la clé Anthropic, visible dans le navigateur si l'appli est déployée publiquement — réservé à tes tests privés.</p>
+                <div className="flex gap-2">
+                  <button onClick={submitProfileForm} disabled={!profileFormBaseUrl.trim() || profileSaving} className="text-13 bg-amber-400 text-app px-4 py-1.5 rounded-lg disabled:opacity-50">{profileSaving ? "Enregistrement…" : "Enregistrer"}</button>
+                  <button onClick={cancelProfileForm} className="text-13 text-slate-400 px-4 py-1.5">Annuler</button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -4353,16 +4489,45 @@ function AdminApp({ theme, setTheme }) {
     // Le fournisseur IA (Anthropic/LM Studio/custom) est chargé ici avec le
     // reste des réglages publics, puis répercuté sur la variable module-level
     // AI_PROVIDER (27/08/2026) — sans ça, callAnthropic() ne saurait pas quel
-    // en-tête envoyer au relais après un rechargement de page. La clé
-    // "custom" (secrète) est chargée juste après, séparément, puis les deux
-    // sont recombinées dans setCustomAiConfig().
+    // en-tête envoyer au relais après un rechargement de page.
+    // CORRECTIF (28/08/2026) : le fournisseur "custom" passe de un seul
+    // (customAiBaseUrl/Model/Key) à plusieurs profils enregistrés
+    // (customAiProfiles + activeCustomProfileId) — voir
+    // migrateLegacyCustomAiProfile(). La migration ne s'exécute qu'une fois
+    // (persistée aussitôt), pour ne jamais perdre une config déjà en place
+    // (ex. DeepSeek) au moment de ce correctif.
     let loadedCustomKey = null;
-    try { const st = await window.storage.get("nandem-public-settings", true); if (st) { const parsed = JSON.parse(st.value); setSettings(parsed); setAiProvider(parsed.aiProvider); } } catch {}
+    let loadedSettings = null;
+    try {
+      const st = await window.storage.get("nandem-public-settings", true);
+      if (st) {
+        loadedSettings = JSON.parse(st.value);
+        const migrated = migrateLegacyCustomAiProfile(loadedSettings);
+        if (migrated) {
+          loadedSettings = { ...loadedSettings, customAiProfiles: [migrated], activeCustomProfileId: migrated.id };
+          try { await window.storage.set("nandem-public-settings", JSON.stringify(loadedSettings), true); } catch {}
+        }
+        setSettings(loadedSettings);
+        setAiProvider(loadedSettings.aiProvider);
+      }
+    } catch {}
     try { const seen = await window.storage.get("nandem-onboarding-seen"); if (!seen) setShowOnboarding(true); } catch { setShowOnboarding(true); }
     try { const cg = await window.storage.get("nandem-custom-goals"); setCustomGoals(cg ? JSON.parse(cg.value) : []); } catch { setCustomGoals([]); }
     try { const ak = await window.storage.get("nandem-api-key"); if (ak?.value) { setApiKeyState(ak.value); setAnthropicApiKey(ak.value); } } catch {}
-    try { const cak = await window.storage.get("nandem-custom-ai-key"); if (cak?.value) { loadedCustomKey = cak.value; setCustomAiKeyState(cak.value); } } catch {}
-    try { const st2 = await window.storage.get("nandem-public-settings", true); const parsed2 = st2 ? JSON.parse(st2.value) : {}; setCustomAiConfig({ baseUrl: parsed2.customAiBaseUrl, model: parsed2.customAiModel, apiKey: loadedCustomKey }); } catch {}
+    // Clé du profil "custom" actif : d'abord la clé propre au profil
+    // (nandem-custom-ai-key:<id>) ; si absente et qu'on vient tout juste de
+    // migrer l'ancien format, se rabat sur l'ancienne clé unique
+    // (nandem-custom-ai-key) — ne perd pas un accès déjà configuré.
+    const activeProfileId = loadedSettings?.activeCustomProfileId || loadedSettings?.customAiProfiles?.[0]?.id || null;
+    if (activeProfileId) {
+      try { const pk = await window.storage.get(`nandem-custom-ai-key:${activeProfileId}`); if (pk?.value) loadedCustomKey = pk.value; } catch {}
+      if (!loadedCustomKey) {
+        try { const legacy = await window.storage.get("nandem-custom-ai-key"); if (legacy?.value) loadedCustomKey = legacy.value; } catch {}
+      }
+    }
+    setCustomAiKeyState(loadedCustomKey);
+    const activeProfile = loadedSettings?.customAiProfiles?.find((p) => p.id === activeProfileId) || null;
+    setCustomAiConfig({ baseUrl: activeProfile?.baseUrl, model: activeProfile?.model, apiKey: loadedCustomKey });
     try { const pa = await window.storage.get("nandem-prompt-addendum"); if (pa?.value) setPromptAddendum(pa.value); } catch {}
     try { const pf = await window.storage.get("nandem-prompt-feedback"); setPromptFeedback(pf ? JSON.parse(pf.value) : []); } catch { setPromptFeedback([]); }
     try { const ma = await window.storage.get("nandem-md-import-addendum"); if (ma?.value) setMdImportAddendum(ma.value); } catch {}
@@ -4509,15 +4674,69 @@ function AdminApp({ theme, setTheme }) {
   async function saveSettings(next) {
     setSettings(next);
     setAiProvider(next.aiProvider); // appliqué immédiatement, sans rechargement (27/08/2026)
-    setCustomAiConfig({ baseUrl: next.customAiBaseUrl, model: next.customAiModel, apiKey: customAiKey });
+    // CORRECTIF (28/08/2026) : la config "custom" active vient désormais des
+    // profils enregistrés (customAiProfiles/activeCustomProfileId), plus des
+    // champs customAiBaseUrl/customAiModel (conservés seulement pour la
+    // rétrocompatibilité d'une sauvegarde plus ancienne, cf.
+    // migrateLegacyCustomAiProfile).
+    const activeProfile = (next.customAiProfiles || []).find((p) => p.id === next.activeCustomProfileId);
+    if (activeProfile) setCustomAiConfig({ baseUrl: activeProfile.baseUrl, model: activeProfile.model, apiKey: customAiKey });
     try { await window.storage.set("nandem-public-settings", JSON.stringify(next), true); } catch {}
   }
-  // Clé du fournisseur "custom" (27/08/2026), même logique que saveApiKey :
-  // stockée à part, jamais dans nandem-public-settings ni dans un export.
-  async function saveCustomAiKey(key) {
-    setCustomAiKeyState(key || null);
-    setCustomAiConfig({ baseUrl: settings.customAiBaseUrl, model: settings.customAiModel, apiKey: key || null });
-    try { key ? await window.storage.set("nandem-custom-ai-key", key) : await window.storage.delete("nandem-custom-ai-key"); } catch {}
+  // AJOUT (28/08/2026) : plusieurs profils "API compatible OpenAI"
+  // enregistrables (DeepSeek, OpenAI, Mistral...) — demande explicite du
+  // porteur ("je voudrais avoir plusieurs choix possible en fonction de mes
+  // clés"). S'appuie sur upsertCustomAiProfile/removeCustomAiProfile
+  // (fonctions pures définies plus haut). La clé reste stockée à part par
+  // profil (nandem-custom-ai-key:<id>), jamais dans nandem-public-settings
+  // ni dans un export — même logique que saveApiKey.
+  //
+  // apiKey vide dans le formulaire ET profil déjà existant = on garde la
+  // clé déjà enregistrée (permet de corriger juste le nom ou l'URL sans
+  // devoir retaper la clé à chaque fois).
+  async function saveCustomAiProfile({ id, name, baseUrl, model, apiKey }) {
+    const profileId = id || genId();
+    const isNew = !id;
+    const profile = { id: profileId, name: (name || "").trim() || "Fournisseur sans nom", baseUrl: (baseUrl || "").trim(), model: (model || "").trim() };
+    const nextProfiles = upsertCustomAiProfile(settings.customAiProfiles, profile);
+    const nextSettings = { ...settings, customAiProfiles: nextProfiles, activeCustomProfileId: profileId };
+    setSettings(nextSettings);
+    try { await window.storage.set("nandem-public-settings", JSON.stringify(nextSettings), true); } catch {}
+    let effectiveKey = null;
+    if (apiKey && apiKey.trim()) {
+      effectiveKey = apiKey.trim();
+      try { await window.storage.set(`nandem-custom-ai-key:${profileId}`, effectiveKey); } catch {}
+    } else if (!isNew) {
+      try { const pk = await window.storage.get(`nandem-custom-ai-key:${profileId}`); effectiveKey = pk?.value || null; } catch {}
+    }
+    setCustomAiKeyState(effectiveKey);
+    setCustomAiConfig({ baseUrl: profile.baseUrl, model: profile.model, apiKey: effectiveKey });
+  }
+  async function deleteCustomAiProfile(id) {
+    const nextProfiles = removeCustomAiProfile(settings.customAiProfiles, id);
+    const wasActive = settings.activeCustomProfileId === id;
+    const nextActiveId = wasActive ? (nextProfiles[0]?.id || null) : settings.activeCustomProfileId;
+    const nextSettings = { ...settings, customAiProfiles: nextProfiles, activeCustomProfileId: nextActiveId };
+    setSettings(nextSettings);
+    try { await window.storage.set("nandem-public-settings", JSON.stringify(nextSettings), true); } catch {}
+    try { await window.storage.delete(`nandem-custom-ai-key:${id}`); } catch {}
+    if (wasActive) {
+      const nextProfile = nextProfiles.find((p) => p.id === nextActiveId) || null;
+      let nextKey = null;
+      if (nextProfile) { try { const pk = await window.storage.get(`nandem-custom-ai-key:${nextActiveId}`); nextKey = pk?.value || null; } catch {} }
+      setCustomAiKeyState(nextKey);
+      setCustomAiConfig({ baseUrl: nextProfile?.baseUrl, model: nextProfile?.model, apiKey: nextKey });
+    }
+  }
+  async function activateCustomAiProfile(id) {
+    const nextSettings = { ...settings, activeCustomProfileId: id };
+    setSettings(nextSettings);
+    try { await window.storage.set("nandem-public-settings", JSON.stringify(nextSettings), true); } catch {}
+    const profile = (settings.customAiProfiles || []).find((p) => p.id === id) || null;
+    let key = null;
+    try { const pk = await window.storage.get(`nandem-custom-ai-key:${id}`); key = pk?.value || null; } catch {}
+    setCustomAiKeyState(key);
+    setCustomAiConfig({ baseUrl: profile?.baseUrl, model: profile?.model, apiKey: key });
   }
   async function saveApiKey(key) {
     setApiKeyState(key || null);
@@ -5195,7 +5414,7 @@ Leçons intégrées au dossier universel : ${promptAddendum ? promptAddendum.spl
       {!selectedId && tab === "bibliotheque" && <LibraryView library={library} onRemove={(id) => persistLibrary(library.filter((l) => l.id !== id))} onAcceptProposal={acceptProposal} onPromote={promoteToQuestion} onScanProjects={scanAllProjectsForPatterns} promptFeedback={promptFeedback} promptAddendum={promptAddendum} onPromoteFeedback={promotePromptFeedback} onDismissFeedback={dismissPromptFeedback} onPromoteSynthesized={promoteSynthesizedLesson} index={index} customGoals={customGoals} questionOverrides={questionOverrides} onAnalyzeQuestionnaires={analyzeQuestionnairesForApp} onAcceptQuestionImprovement={acceptQuestionImprovement} onRevertQuestionImprovement={revertQuestionImprovement} onUpdateStatut={updatePatternStatut} engineRequirements={engineRequirements} onImportRequirements={importEngineRequirements} onRemoveRequirement={(id) => persistEngineRequirements(engineRequirements.filter((r) => r.id !== id))} onUpdateRequirement={updateEngineRequirement} onAnalyzeFormalization={analyzeObservationsForFormalization} onAcceptFormalization={acceptFormalizedRequirement} onAddManualObservation={addManualObservation} onImportManualObservations={importManualObservations} />}
       {!selectedId && tab === "historique" && <HistoriqueView index={index} onArchiveProject={archiveProject} onSelectProject={setSelectedId} library={library} onUpdateStatut={updatePatternStatut} onRemove={(id) => persistLibrary(library.filter((l) => l.id !== id))} />}
       {!selectedId && tab === "corbeille" && <CorbeilleView index={index} onRestoreProject={restoreProject} onSelectProject={setSelectedId} />}
-      {!selectedId && tab === "reglages" && <ReglagesView settings={settings} onSave={saveSettings} onReplayOnboarding={() => setShowOnboarding(true)} theme={theme} setTheme={setTheme} apiKey={apiKey} onSaveApiKey={saveApiKey} customAiKey={customAiKey} onSaveCustomAiKey={saveCustomAiKey} onExportAll={exportEverything} onImportAll={importEverything} />}
+      {!selectedId && tab === "reglages" && <ReglagesView settings={settings} onSave={saveSettings} onReplayOnboarding={() => setShowOnboarding(true)} theme={theme} setTheme={setTheme} apiKey={apiKey} onSaveApiKey={saveApiKey} onSaveCustomAiProfile={saveCustomAiProfile} onDeleteCustomAiProfile={deleteCustomAiProfile} onActivateCustomAiProfile={activateCustomAiProfile} onExportAll={exportEverything} onImportAll={importEverything} />}
       {selectedId && loadingSelected && <div className="flex items-center justify-center h-header-offset"><Loader2 className="animate-spin text-amber-400" /></div>}
       {selectedId && !loadingSelected && !selectedProject && (
         <div className="flex flex-col items-center justify-center h-header-offset px-6 text-center gap-3">

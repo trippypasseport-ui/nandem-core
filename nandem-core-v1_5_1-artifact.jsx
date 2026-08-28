@@ -1395,6 +1395,29 @@ ${dump}`;
   catch { return { proposals: [], scanned: projects.length }; }
 }
 
+// CORRECTIF (28/08/2026) : certains fournisseurs IA (constaté avec un modèle
+// "custom" hors Anthropic) renvoient parfois un champ de synthèse comme objet
+// structuré (ex. {nom, description} ou {fonctionnalité, priorité}) au lieu du
+// texte simple attendu par ce prompt (buildSynthesisPrompt) — le mode JSON
+// strict ajouté plus tôt (askClaudeJSON) garantit un JSON valide, pas la
+// FORME de son contenu. Sans ce correctif, React plante entièrement (erreur
+// #31, "Objects are not valid as a React child") dès qu'on ouvre la fiche
+// projet concernée — page blanche, aucun message clair pour le porteur.
+// Cette fonction rend TOUJOURS un texte affichable, quelle que soit la forme
+// reçue, sans jamais perdre l'information ni faire planter la page.
+function synthesisFieldText(value) {
+  if (value == null || value === "") return "Non renseigné";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map((item) => synthesisFieldText(item)).join("\n");
+  if (typeof value === "object") {
+    const label = value.nom || value.name || value.titre || value.label;
+    const detail = value.description || value.text || value.details || value.question;
+    if (label && detail) return `${label} — ${detail}`;
+    if (label) return String(label);
+    return Object.entries(value).map(([k, v]) => `${k} : ${typeof v === "object" ? synthesisFieldText(v) : v}`).join(" · ");
+  }
+  return String(value);
+}
 const SYNTHESIS_FIELDS = [
   ["resume", "Résumé"], ["besoinReel", "Besoin réel"], ["activite", "Activité"],
   ["utilisateurs", "Utilisateurs"], ["objetsMetier", "Objets métier"], ["processusMetier", "Processus métier"],
@@ -1543,7 +1566,7 @@ function buildFullExportText(project) {
   text += `Créé le : ${new Date(project.date).toLocaleDateString("fr-FR")}\n\n--- RÉPONSES BRUTES DU DIAGNOSTIC ---\n`;
   Object.entries(a).filter(([id]) => id !== "commentaireLibre").forEach(([, ans]) => { text += `${ans.label} : ${ans.text}\n`; });
   if (a.commentaireLibre?.text) text += `Remarque libre : ${a.commentaireLibre.text}\n`;
-  if (s) { text += `\n--- CAHIER DES CHARGES ---\n`; SYNTHESIS_FIELDS.forEach(([k, label]) => { text += `\n${label}\n${s[k] || "Non renseigné"}\n`; }); }
+  if (s) { text += `\n--- CAHIER DES CHARGES ---\n`; SYNTHESIS_FIELDS.forEach(([k, label]) => { text += `\n${label}\n${synthesisFieldText(s[k])}\n`; }); }
   if (project.proposal) text += `\n--- PROPOSITION COMMERCIALE ---\n${project.proposal}\n`;
   if (project.conception) text += `\n--- CONCEPTION TECHNIQUE ---\n${project.conception}\n`;
   if (project.validatedIdeas?.length) text += `\n--- SUGGESTIONS VALIDÉES ---\n${project.validatedIdeas.map((v) => `- ${v.label} : ${v.description}`).join("\n")}\n`;
@@ -1658,7 +1681,7 @@ function buildClientEmailBody(answers, synthesis) {
   let body = `Nouveau diagnostic reçu via NANDĒM Discovery.\n\n--- RÉPONSES ---\n`;
   Object.entries(answers).filter(([id]) => id !== "commentaireLibre").forEach(([, a]) => { body += `${a.label} : ${a.text}\n`; });
   if (answers.commentaireLibre?.text) body += `Remarque libre : ${answers.commentaireLibre.text}\n`;
-  if (synthesis) { body += `\n--- SYNTHÈSE ---\n`; SYNTHESIS_FIELDS.forEach(([k, label]) => { body += `\n${label}\n${synthesis[k] || "Non renseigné"}\n`; }); }
+  if (synthesis) { body += `\n--- SYNTHÈSE ---\n`; SYNTHESIS_FIELDS.forEach(([k, label]) => { body += `\n${label}\n${synthesisFieldText(synthesis[k])}\n`; }); }
   return body;
 }
 function formatTranscript(messages) {
@@ -2785,7 +2808,7 @@ function ProjectDetail({ project, onAddToLibrary, libraryIds, onSetConception, o
             {[["resume", "Résumé"], ["priorites", "Priorité"], ["complexite", "Complexité estimée"]].map(([key, label]) => (
               <div key={key} className="pb-4 border-b border-app-soft last:border-0">
                 <p className="text-11 uppercase tracking-wider text-amber-400/70 mb-1">{label}</p>
-                <p className="text-14 text-slate-300 leading-relaxed whitespace-pre-line">{s[key] || "Non renseigné"}</p>
+                <p className="text-14 text-slate-300 leading-relaxed whitespace-pre-line">{synthesisFieldText(s[key])}</p>
               </div>
             ))}
           </div>
@@ -2796,7 +2819,7 @@ function ProjectDetail({ project, onAddToLibrary, libraryIds, onSetConception, o
         <div>
           <h2 className="font-display text-lg mb-2">Cahier des charges</h2>
           {error && <div className="mb-5 p-3 rounded-xl bg-red-400/10 border border-red-400/20 text-red-300 text-sm">{error}</div>}
-          <div className="space-y-4">{SYNTHESIS_FIELDS.map(([key, label]) => { const libId = `${project.id}:${key}`; const inLib = libraryIds.has(libId); const fieldWhat = `field:${key}`; return (<div key={key} className="pb-4 border-b border-app-soft last:border-0 group"><div className="flex items-center justify-between mb-1.5"><p className="text-11 uppercase tracking-wider text-amber-400/70">{label}</p><div className="flex items-center gap-1.5"><button onClick={() => copy(s[key], fieldWhat)} disabled={!s[key] || s[key] === "Non renseigné"} className="text-10 px-2 py-0.5 rounded-full border border-app text-slate-500 hover:border-amber-400/30 hover:text-amber-300 disabled:opacity-30 transition-colors flex items-center gap-1">{copiedWhat === fieldWhat ? <Check size={10} /> : <Copy size={10} />}{copiedWhat === fieldWhat ? "Copié" : "Copier"}</button><button onClick={() => !inLib && onAddToLibrary(project, key, label, s[key])} disabled={inLib || !s[key] || s[key] === "Non renseigné"} className={`text-10 px-2 py-0.5 rounded-full border flex items-center gap-1 transition-colors ${inLib ? "border-amber-400/40 text-amber-300" : "border-app text-slate-500 hover:border-amber-400/30 hover:text-amber-300 disabled:opacity-30"}`}>{inLib ? <Check size={10} /> : <Plus size={10} />}{inLib ? "Dans la bibliothèque" : "Ajouter"}</button></div></div><p className="text-14 text-slate-300 leading-relaxed whitespace-pre-line">{s[key] || "Non renseigné"}</p></div>); })}</div>
+          <div className="space-y-4">{SYNTHESIS_FIELDS.map(([key, label]) => { const libId = `${project.id}:${key}`; const inLib = libraryIds.has(libId); const fieldWhat = `field:${key}`; const fieldText = synthesisFieldText(s[key]); return (<div key={key} className="pb-4 border-b border-app-soft last:border-0 group"><div className="flex items-center justify-between mb-1.5"><p className="text-11 uppercase tracking-wider text-amber-400/70">{label}</p><div className="flex items-center gap-1.5"><button onClick={() => copy(fieldText, fieldWhat)} disabled={fieldText === "Non renseigné"} className="text-10 px-2 py-0.5 rounded-full border border-app text-slate-500 hover:border-amber-400/30 hover:text-amber-300 disabled:opacity-30 transition-colors flex items-center gap-1">{copiedWhat === fieldWhat ? <Check size={10} /> : <Copy size={10} />}{copiedWhat === fieldWhat ? "Copié" : "Copier"}</button><button onClick={() => !inLib && onAddToLibrary(project, key, label, fieldText)} disabled={inLib || fieldText === "Non renseigné"} className={`text-10 px-2 py-0.5 rounded-full border flex items-center gap-1 transition-colors ${inLib ? "border-amber-400/40 text-amber-300" : "border-app text-slate-500 hover:border-amber-400/30 hover:text-amber-300 disabled:opacity-30"}`}>{inLib ? <Check size={10} /> : <Plus size={10} />}{inLib ? "Dans la bibliothèque" : "Ajouter"}</button></div></div><p className="text-14 text-slate-300 leading-relaxed whitespace-pre-line">{fieldText}</p></div>); })}</div>
           <div className="border-t border-app pt-5 mt-6">
             <h3 className="font-display text-base mb-2">Notes complémentaires</h3>
             <p className="text-11 text-slate-600 mb-3">Ce que tu ajoutes après coup — une réflexion menée avec n’importe quelle IA, un expert, ou toi-même. Vient enrichir la conception et le dossier de construction, sans nouvel appel IA ici.</p>

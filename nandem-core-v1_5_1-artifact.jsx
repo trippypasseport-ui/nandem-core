@@ -576,8 +576,34 @@ function anthropicHeaders(base) {
     ? { ...base, "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }
     : base;
 }
+// CORRECTIF (27/08/2026) : étendu au réseau local (Wi-Fi maison) — le porteur
+// veut ouvrir la page locale depuis son téléphone, pas seulement depuis le
+// Mac qui fait tourner le relais. "localhost" ne veut rien dire pour un
+// téléphone (ça désignerait le téléphone lui-même) ; il doit taper l'adresse
+// IP locale du Mac (ex. 192.168.1.23) — donc le test doit aussi reconnaître
+// ces plages d'IP privées, en plus de 127.0.0.1/localhost/::1. Statut
+// Prometteur : la détection par plage d'IP est correcte par construction
+// (RFC 1918), mais n'a pas encore été testée en usage réel depuis un
+// téléphone — à confirmer.
+const LAN_IP_PATTERN = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/;
+// AJOUT (27/08/2026) : ngrok (ou tunnel équivalent) — le porteur fait tourner
+// nandem-ai-relay.mjs sur son Mac et expose ce port via un tunnel public
+// (ex. "ngrok http 8000"), pour y accéder depuis n'importe où (pas
+// uniquement le même Wi-Fi). ngrok redirige TOUTES les routes vers le
+// serveur local, /__nandem_ai et /__nandem_storage compris — donc tant que
+// la page elle-même est chargée via ce tunnel, le relais reste bien celui
+// du Mac. Reconnu par le nom de domaine, pas par IP (impossible à prédire).
+// Couvre gratuit (.ngrok-free.app/.ngrok-free.dev) et payant (.ngrok.app/.ngrok.io).
+// Statut Hypothèse : correct par construction, pas encore vérifié en usage réel.
+const TUNNEL_DOMAIN_PATTERN = /\.(ngrok-free\.app|ngrok-free\.dev|ngrok\.app|ngrok\.io)$/;
 function useLocalAiRelay() {
-  return typeof window !== "undefined" && ["127.0.0.1", "localhost", "::1"].includes(window.location.hostname);
+  if (typeof window === "undefined") return false;
+  const host = window.location.hostname;
+  if (["127.0.0.1", "localhost", "::1"].includes(host)) return true;
+  if (LAN_IP_PATTERN.test(host)) return true;
+  if (TUNNEL_DOMAIN_PATTERN.test(host)) return true;
+  if (host.endsWith(".local")) return true; // ex. MacBook-Air-de-fereol.local, résolu par Bonjour/mDNS
+  return false;
 }
 async function callAnthropic(body) {
   const local = useLocalAiRelay();
@@ -646,6 +672,23 @@ async function askClaudeCompleteMarkdown(userContent, maxTokens = 3500, maxConti
 
   return completeText.trim();
 }
+// CORRECTIF (27/08/2026) : réparation légère avant d'abandonner. Constaté en
+// usage réel avec un modèle local (LM Studio/Bionic) : contrairement à
+// Anthropic, un petit modèle local produit parfois un JSON presque correct
+// mais avec des clés non citées ({learningProposal: "..."} au lieu de
+// {"learningProposal": "..."}) ou une virgule finale — ce qui faisait
+// planter extractJSON avec une erreur bas niveau incompréhensible pour le
+// porteur ("Expected double-quoted property name..."). Deux réparations
+// SEULEMENT, choisies parce qu'elles ne peuvent pas corrompre du texte
+// français légitime (apostrophes, guillemets) : virgule finale avant } ou ],
+// et clés d'objet non citées. Jamais de remplacement de guillemets simples
+// par des doubles — trop risqué sur du texte contenant des apostrophes
+// ("l'appli", "d'informations"...).
+function tryRepairJSON(text) {
+  return text
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":');
+}
 function extractJSON(raw) {
   const cleaned = raw.replace(/```json|```/g, "").trim();
   const first = cleaned.indexOf("{");
@@ -655,7 +698,12 @@ function extractJSON(raw) {
   const lastSquare = cleaned.lastIndexOf("]");
   const end = Math.max(lastCurly, lastSquare);
   if (start === -1 || end === -1) return JSON.parse(cleaned); // laisse planter avec l'erreur d'origine si vraiment rien d'exploitable
-  return JSON.parse(cleaned.slice(start, end + 1));
+  const slice = cleaned.slice(start, end + 1);
+  try { return JSON.parse(slice); }
+  catch (originalError) {
+    try { return JSON.parse(tryRepairJSON(slice)); }
+    catch { throw originalError; } // la réparation a aussi échoué — remonte l'erreur d'origine, plus utile pour diagnostiquer
+  }
 }
 async function relanceVague(goal, answer) {
   const prompt = `Tu formules UNE relance de clarification, maximum 20 mots, aucune proposition, aucune solution.
@@ -4539,6 +4587,13 @@ function AdminApp({ theme, setTheme }) {
   const [importingJsx, setImportingJsx] = useState(false);
   const [importJsxFileName, setImportJsxFileName] = useState("");
   const jsxFileInputRef = useRef(null);
+  // AJOUT (27/08/2026) : suppression directement possible depuis la liste
+  // Projets — jusqu'ici il fallait ouvrir une fiche déjà diagnostiquée pour
+  // trouver "Supprimer" (ou passer par Historique → Projets, moins visible).
+  // Même mécanisme qu'ailleurs dans l'app (archiveProject = archivage
+  // réversible, jamais une suppression silencieuse), juste rendu accessible
+  // depuis l'écran où le porteur regarde en premier.
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   // AJOUT (27/08/2026) : sélection directe du fichier .jsx depuis le disque
   // (au lieu d'un copier-coller obligatoire) — lu en local dans le
   // navigateur via FileReader, jamais envoyé nulle part avant l'appel IA.
@@ -5030,10 +5085,20 @@ Leçons intégrées au dossier universel : ${promptAddendum ? promptAddendum.spl
           {(() => {
             function ProjectRow(p) {
               return (
-                <button key={p.id} onClick={() => setSelectedId(p.id)} className="w-full text-left p-4 rounded-xl bg-surface border border-app hover:border-amber-400/30 transition-colors flex items-center justify-between group">
-                  <div><p className="text-sm text-cream">{p.nom}</p><div className="flex items-center gap-2 mt-1 flex-wrap"><span className="text-10 px-2 py-0.5 rounded-full border border-app text-slate-500">{p.categorie}</span><span className="text-10 px-2 py-0.5 rounded-full border border-amber-400/20 text-amber-400/70">{p.pipeline || "Prospect"}</span><span className="text-10 text-slate-600 font-mono-data">{p.hasConception ? "Conception prête" : p.hasDiscovery ? "Diagnostic terminé" : "Diagnostic non fait"}</span></div></div>
-                  <ChevronRight size={16} className="text-slate-600 group-hover:text-amber-400 transition-colors" />
-                </button>
+                <div key={p.id} className="w-full p-4 rounded-xl bg-surface border border-app hover:border-amber-400/30 transition-colors flex items-center justify-between gap-2 group">
+                  <button onClick={() => setSelectedId(p.id)} className="min-w-0 flex-1 text-left flex items-center justify-between gap-2">
+                    <div className="min-w-0"><p className="text-sm text-cream truncate">{p.nom}</p><div className="flex items-center gap-2 mt-1 flex-wrap"><span className="text-10 px-2 py-0.5 rounded-full border border-app text-slate-500">{p.categorie}</span><span className="text-10 px-2 py-0.5 rounded-full border border-amber-400/20 text-amber-400/70">{p.pipeline || "Prospect"}</span><span className="text-10 text-slate-600 font-mono-data">{p.hasConception ? "Conception prête" : p.hasDiscovery ? "Diagnostic terminé" : "Diagnostic non fait"}</span></div></div>
+                    <ChevronRight size={16} className="text-slate-600 group-hover:text-amber-400 transition-colors shrink-0" />
+                  </button>
+                  {deleteConfirmId === p.id ? (
+                    <div className="flex gap-1.5 shrink-0">
+                      <button onClick={() => setDeleteConfirmId(null)} className="text-11 px-2 py-1 rounded-full border border-app text-slate-500">Annuler</button>
+                      <button onClick={() => { archiveProject(p.id); setDeleteConfirmId(null); }} className="text-11 px-2 py-1 rounded-full bg-red-400/80 text-app">Confirmer</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setDeleteConfirmId(p.id)} title="Supprimer (réversible, retrouvable dans Historique)" className="shrink-0 p-1.5 rounded-lg border border-app text-slate-500 hover:border-red-400/40 hover:text-red-300 transition-colors"><Trash2 size={13} /></button>
+                  )}
+                </div>
               );
             }
             const recents = index.filter((p) => !p.archived).slice(0, 5);
